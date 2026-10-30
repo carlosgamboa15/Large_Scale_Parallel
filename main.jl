@@ -5,10 +5,11 @@ Pkg.instantiate()
 using JuMP, Gurobi, JSON, Distributions, Polyhedra, CDDLib, Dualization, LinearAlgebra, Statistics, Plots, LaTeXStrings
 using GLM, DataFrames, Random, NearestNeighbors, StatsPlots
 using Plots.Measures
-using Base.Threads
+using Distributed
 const GUROBI_ENV = Gurobi.Env()
 
 include(joinpath(pwd(),"getData.jl"))
+addprocs(10)
 
 using Main.getData
 
@@ -183,7 +184,7 @@ function uncertainty_support(Data, zstar, errors)
     
 end
 
-function economic_dispatch_problem(Data, u, v, w)
+@everywhere function economic_dispatch_problem(Data, u, v, w)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -242,7 +243,7 @@ function economic_dispatch_problem(Data, u, v, w)
     @constraint(model, x5[i in Ig, t in [1]], p[i, t] <= RU[i]*u0[i] + Pmax[i]*v[i, t] + p0[i])
     @constraint(model, x6[i in Ig, t in [1]], -p[i, t] <= RD[i]*u[i, t] + Pmax[i]*w[i, t] - p0[i])
 
-    M_penalizacion = 1e4
+    M_penalizacion = 1e6
 
     @objective(model, Min, sum(Cp[i]*p[i,t] for i in Ig, t in T) + sum(Cdef*pdef[b,t] for b in 1:Tb, t in T) + sum(0.1*Cdef*s[b,t] for b in bus_renewable_generation, t in T) + sum(M_penalizacion * (s_positivo[b,t] + s_negativo[b,t]) for b ∈ bus_renewable_generation, t ∈ T))
     # @objective(model, Min, sum(Cp[i]*p[i,t] for i in Ig, t in T) + sum(Cdef*pdef[b,t] for b in 1:Tb, t in T) + sum(0.1*Cdef*s[b,t] for b in bus_renewable_generation, t in T) )
@@ -250,7 +251,7 @@ function economic_dispatch_problem(Data, u, v, w)
     return model
 end
 
-function create_oracle_problem(Data)
+@everywhere function create_oracle_problem(Data)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -268,14 +269,14 @@ function create_oracle_problem(Data)
     @constraint(m_oracle, [b in bus_renewable_generation, t in T], ηpos[b, t] + ηneg[b, t] ≤ 1)
     @constraint(m_oracle,  positive[b in bus_renewable_generation, t in T], ηpos[b, t] + ηneg[b, t] ≤ 0)
 
-    set_optimizer(m_oracle, optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0))
+    set_optimizer(m_oracle, optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0, "Threads" => 1))
     obj = objective_function(m_oracle)
 
     return m_oracle, obj
 
 end
 
-function modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
+@everywhere function modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
 
     Tf = Data.Tf
     number_of_generators = Data.Ig
@@ -350,7 +351,7 @@ function modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionS
 
 end
 
-function solve_oracle_problem(Data, m_oracle, obj, z, y, Ξ_y, u, v, w, λ, μ, θ, oracle_dict, zstar, PredictionStar)
+@everywhere function solve_oracle_problem(Data, n, z, y, Ξ_y, u, v, w, λ, μ, θ, oracle_dict, zstar, PredictionStar)
     
     N = Data.N
     Tf = Data.Tf
@@ -366,96 +367,82 @@ function solve_oracle_problem(Data, m_oracle, obj, z, y, Ξ_y, u, v, w, λ, μ, 
     u0 = zeros(number_of_generators)
 
     T = collect(1:Tf)   
-    a = Ξ_y[:,1]
+    a = max.(Ξ_y[:,1], -vcat(PredictionStar...))
     b = Ξ_y[:,2]
     zstar_global = vcat(zstar...)
 
-    violation = [true for n ∈ 1:N]
+    violation = true
 
-    for n ∈ 1:N
+    m_oracle, obj  = create_oracle_problem(Data)
+
+    val, time_ = @timed(begin
+        modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
+        optimize!(m_oracle)
+        status = termination_status(m_oracle)
+        if status != MOI.OPTIMAL
+            error("Subproblem n = $n, Oracle Status: $(status)" )
+        end
+    end)
+    obj_val = objective_value(m_oracle)
+    viol = μ[n] + θ - obj_val + λ*norm(zstar_global - z[n],1)
+    yproj = clamp.(y[n], a, b)  
+    Δpos = b .- yproj
+    Δneg = yproj .- a
+    ηpos_val = [value.(m_oracle[:ηpos])[b, t] for b ∈ bus_renewable_generation, t ∈ T]
+    ηpos = vec(ηpos_val')
+    ηneg_val = [value.(m_oracle[:ηneg])[b, t] for b ∈ bus_renewable_generation, t ∈ T]
+    ηneg = vec(ηneg_val')
+    y_opt = yproj .+ ηpos .* Δpos .- ηneg .* Δneg
+    oracle_dict["y"]["$n"] = @views [y_opt[((b - 1) * Tf + 1):(b * Tf)] for b in 1:length(bus_renewable_generation)]
+
+    const_term_x1, const_term_x2, const_term_x3, const_term_x4, const_term_x5, const_term_x6 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     
-        val, time_ = @timed(begin
-            modify_oracle(Data, m_oracle, obj, y, Ξ_y, n, u ,v, w, λ, PredictionStar)
-            optimize!(m_oracle)
-            status = termination_status(m_oracle)
-            if status != MOI.OPTIMAL
-                error("Subproblem n = $n, Oracle Status: $(status)" )
-            end
-        end)
-        obj_val = objective_value(m_oracle)
-        viol = μ[n] + θ - obj_val + λ*norm(zstar_global - z[n],1)
-        yproj = clamp.(y[n], a, b)  
-        Δpos = b .- yproj
-        Δneg = yproj .- a
-        ηpos_val = [value.(m_oracle[:ηpos])[b, t] for b ∈ bus_renewable_generation, t ∈ T]
-        ηpos = vec(ηpos_val')
-        ηneg_val = [value.(m_oracle[:ηneg])[b, t] for b ∈ bus_renewable_generation, t ∈ T]
-        ηneg = vec(ηneg_val')
-        y_opt = yproj .+ ηpos .* Δpos .- ηneg .* Δneg
-        oracle_dict["y"]["$n"] = @views [y_opt[((b - 1) * Tf + 1):(b * Tf)] for b in 1:length(bus_renewable_generation)]
+    for t ∈ T
 
-       const_term_x1, const_term_x2, const_term_x3, const_term_x4, const_term_x5, const_term_x6 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-        
-        for t ∈ T
+        for b in bus_renewable_generation
 
-            for b in bus_renewable_generation
-
-                oracle_dict["π"]["$n"]["($b, $t)"] = value(m_oracle[Symbol("π[$b,$t]")])
-                oracle_dict["π_s"]["$n"]["($b, $t)"] = value(m_oracle[Symbol("π_s[$b,$t]")])
-
-            end
-
-            for i in Ig
-
-                oracle_dict["x1"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x1[$i,$t]")])
-                oracle_dict["x2"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x2[$i,$t]")])
-                const_term_x1 += Pmax[i]*u[i, t]  * value(m_oracle[Symbol("x1[$i,$t]")])
-                const_term_x2 += Pmin[i]*u[i, t]  * value(m_oracle[Symbol("x2[$i,$t]")])
-
-                if t == 1
-
-                    oracle_dict["x5"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x5[$i,$t]")])
-                    oracle_dict["x6"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x6[$i,$t]")])
-                    const_term_x5 += (RU[i]*u0[i] + Pmax[i]*v[i, t] + p0[i]) * value(m_oracle[Symbol("x5[$i,$t]")])
-                    const_term_x6 += (RD[i]*u[i, t] + Pmax[i]*w[i, t] - p0[i]) * value(m_oracle[Symbol("x6[$i,$t]")])
-
-                else
-
-                    oracle_dict["x3"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x3[$i,$t]")])
-                    oracle_dict["x4"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x4[$i,$t]")])
-                    const_term_x3 += (RU[i]*u[i, t-1] + Pmax[i]*v[i, t])* value(m_oracle[Symbol("x3[$i,$t]")])
-                    const_term_x4 += (RD[i]*u[i, t] + Pmax[i]*w[i, t])* value(m_oracle[Symbol("x4[$i,$t]")])
-
-                end
-
-            end
+            oracle_dict["π"]["$n"]["($b, $t)"] = value(m_oracle[Symbol("π[$b,$t]")])
+            oracle_dict["π_s"]["$n"]["($b, $t)"] = value(m_oracle[Symbol("π_s[$b,$t]")])
 
         end
 
-        if any(ηpos .> 0) || any(ηneg .> 0)
-            println("Subproblem n = $n optimal and  nominal projection  are different")
-        end
+        for i in Ig
 
-        oracle_dict["const"]["$n"] = copy(objective_value(m_oracle) - (const_term_x1 + const_term_x2 + const_term_x3 + const_term_x4 + const_term_x5 + const_term_x6) - λ*norm(y_opt - y[n],1))
-        oracle_dict["time"]["$n"] = time_
+            oracle_dict["x1"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x1[$i,$t]")])
+            oracle_dict["x2"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x2[$i,$t]")])
+            const_term_x1 += Pmax[i]*u[i, t]  * value(m_oracle[Symbol("x1[$i,$t]")])
+            const_term_x2 += Pmin[i]*u[i, t]  * value(m_oracle[Symbol("x2[$i,$t]")])
 
-        oracle_dict["ϑ"][n] = objective_value(m_oracle) - λ*norm(zstar_global - z[n],1)
+            if t == 1
 
-        if viol ≥ -1e-2
-            violation[n] = false
-        else
-            violation[n] = true
+                oracle_dict["x5"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x5[$i,$t]")])
+                oracle_dict["x6"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x6[$i,$t]")])
+                const_term_x5 += (RU[i]*u0[i] + Pmax[i]*v[i, t] + p0[i]) * value(m_oracle[Symbol("x5[$i,$t]")])
+                const_term_x6 += (RD[i]*u[i, t] + Pmax[i]*w[i, t] - p0[i]) * value(m_oracle[Symbol("x6[$i,$t]")])
+
+            else
+
+                oracle_dict["x3"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x3[$i,$t]")])
+                oracle_dict["x4"]["$n"]["($i, $t)"] = value(m_oracle[Symbol("x4[$i,$t]")])
+                const_term_x3 += (RU[i]*u[i, t-1] + Pmax[i]*v[i, t])* value(m_oracle[Symbol("x3[$i,$t]")])
+                const_term_x4 += (RD[i]*u[i, t] + Pmax[i]*w[i, t])* value(m_oracle[Symbol("x4[$i,$t]")])
+
+            end
+
         end
 
     end
 
-    if sum(violation) < N 
-        print("feasibility for $(N - sum(violation)) subproblems\n")
+    oracle_dict["const"]["$n"] = copy(objective_value(m_oracle) + λ*norm(y_opt - y[n],1) - (const_term_x1 + const_term_x2 + const_term_x3 + const_term_x4 + const_term_x5 + const_term_x6) - λ*norm(y_opt - y[n],1))
+    oracle_dict["time"]["$n"] = time_
+
+    oracle_dict["ϑ"][n] = objective_value(m_oracle) - λ*norm(zstar_global - z[n],1)
+
+    if viol ≥ -1e-2
+        violation = false
     end
 
-    convergence = ~Base.any(violation)
-
-    return convergence
+    return violation
     
 end
 
@@ -1501,10 +1488,6 @@ function Benders_algorithm(Data, Ξ_y, zstar, PredictionStar, ρ, α)
 
     m_master = create_master_problem(Data, ρ)
     initial_cuts, idx = initilization_restricted_master_Benders(Data, m_master, z, zstar, y, Ξ_y, PredictionStar, α)
-    # initial_cuts, idx = [], []
-    # @constraint(m_master, m_master[:θ] ≥ - 1e10)
-    m_oracle, obj  = create_oracle_problem(Data)
-    models = [deepcopy(model_oracle) for _ in 1:N]
     convergence = false
     Max_iter = 250
     cumulative_time = 0.0
@@ -1515,7 +1498,10 @@ function Benders_algorithm(Data, Ξ_y, zstar, PredictionStar, ρ, α)
     while ~convergence && iter ≤ Max_iter  && gap ≥ 5e-2
 
         global u_Benders, v_Benders, w_Benders, λ_Benders, μ_Benders, θ_Benders, LB_Benders, time_master_Benders = solve_master_problem(m_master)
-        convergence = solve_oracle_problem(Data, m_oracle, obj, z, y, Ξ_y, u_Benders, v_Benders, w_Benders, λ_Benders, μ_Benders, θ_Benders, oracle_dict, zstar, PredictionStar)
+        results = pmap(
+            n -> solve_oracle_problem(Data, n, z, y, Ξ_y, u_Benders, v_Benders, w_Benders, λ_Benders, μ_Benders, θ_Benders, oracle_dict, zstar, PredictionStar),
+            1:N
+        )
         UB_Benders = minimum([UB_Benders, Upper_Bound(Data, u_Benders, v_Benders, w_Benders, λ_Benders, oracle_dict["ϑ"], α)])
         update_master_Benders(Data, m_master, z, zstar, y, oracle_dict, cuts_Benders, cuts)
         total_time_oracle = sum(oracle_dict["time"]["$n"][end] for n ∈ sample)
